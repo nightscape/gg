@@ -28,7 +28,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "msi",
+      "dmg",
+      "appimage"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -39,7 +43,15 @@
     "windows": {
       "certificateThumbprint": "a2da0d655fd327e046f5878a11053f2b9c2e2233",
       "digestAlgorithm": "sha384",
-      "timestampUrl": "http://timestamp.digicert.com"
+      "timestampUrl": "http://timestamp.digicert.com",
+      "wix": {
+        "fragmentPaths": [
+          "./resources/registry.wxs"
+        ],
+        "componentRefs": [
+          "RegistryEntries"
+        ]
+      }
     }
   },
   "plugins": {}
