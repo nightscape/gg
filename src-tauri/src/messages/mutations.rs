@@ -144,6 +144,18 @@ pub struct MoveChanges {
     derive(TS),
     ts(export, export_to = "../src/messages/")
 )]
+pub struct MoveHunk {
+    pub from_id: RevId,
+    pub to_id: RevId,
+    pub hunk_id: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[cfg_attr(
+    feature = "ts-rs",
+    derive(TS),
+    ts(export, export_to = "../src/messages/")
+)]
 pub struct CopyChanges {
     pub from_id: CommitId, // limitation: we don't know parent chids because they are more expensive to look up
     pub to_id: RevId,

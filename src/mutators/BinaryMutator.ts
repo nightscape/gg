@@ -11,6 +11,7 @@ import RevisionMutator from "./RevisionMutator";
 import ChangeMutator from "./ChangeMutator";
 import RefMutator from "./RefMutator";
 import type { StoreRef } from "../messages/StoreRef";
+import type { MoveHunk } from "../messages/MoveHunk";
 
 export type RichHint = (string | ChangeId | CommitId | Extract<StoreRef, { type: "LocalBranch" } | { type: "RemoteBranch" }>)[];
 export type Eligibility = { type: "yes", hint: RichHint } | { type: "maybe", hint: string } | { type: "no" };
@@ -137,6 +138,12 @@ export default class BinaryMutator {
             }
         }
 
+        if (this.#from.type == "Hunk") {
+            if (this.#to.type == "Revision") {
+                return { type: "yes", hint: ["Moving hunk ", this.#from.hunkId, " to ", this.#to.header.id.change] };
+            }
+        }
+
         return { type: "no" };
     }
 
@@ -184,7 +191,7 @@ export default class BinaryMutator {
             }
         }
 
-        if (this.#from.type == "Ref") {
+        if (this.#from.type == "Ref" && this.#from.ref.type != "Tag") {
             if (this.#to.type == "Revision") {
                 // point ref to revision
                 mutate<MoveRef>("move_ref", { to_id: this.#to.header.id, ref: this.#from.ref });
@@ -195,6 +202,14 @@ export default class BinaryMutator {
             } else if (this.#to.type == "Repository") {
                 // various kinds of total or partial deletion
                 new RefMutator(this.#from.ref).onDelete();
+            }
+        }
+
+        if (this.#from.type == "Hunk") {
+            if (this.#to.type == "Revision") {
+                // Logic to move hunk to target revision
+                mutate<MoveHunk>("move_hunk", { hunkId: this.#from.hunkId, to_id: this.#to.header.id });
+                return;
             }
         }
 

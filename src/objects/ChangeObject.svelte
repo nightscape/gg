@@ -10,8 +10,11 @@
     export let header: RevHeader;
     export let change: RevChange;
     export let selected: boolean;
+    export let hunkId: string | null = null;
 
-    let operand: Operand = { type: "Change", header, path: change.path };
+    let operand: Operand = hunkId 
+        ? { type: "Hunk", header, hunkId } 
+        : { type: "Change", header, path: change.path };
 
     let icon = "file";
     let state: "add" | "change" | "remove" | null = null;

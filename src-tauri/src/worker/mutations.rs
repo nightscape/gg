@@ -24,7 +24,7 @@ use super::{gui_util::WorkspaceSession, Mutation};
 use crate::messages::{
     AbandonRevisions, BackoutRevisions, CheckoutRevision, CopyChanges, CreateRef, CreateRevision,
     DeleteRef, DescribeRevision, DuplicateRevisions, GitFetch, GitPush, InsertRevision,
-    MoveChanges, MoveRef, MoveRevision, MoveSource, MutationResult, RenameBranch, StoreRef,
+    MoveChanges, MoveHunk, MoveRef, MoveRevision, MoveSource, MutationResult, RenameBranch, StoreRef,
     TrackBranch, TreePath, UndoOperation, UntrackBranch,
 };
 
@@ -49,9 +49,9 @@ impl Mutation for AbandonRevisions {
         }
 
         for id in &abandoned_ids {
-            tx.mut_repo().record_abandoned_commit(id.clone());
+            tx.repo_mut().record_abandoned_commit(id.clone());
         }
-        tx.mut_repo().rebase_descendants(&ws.data.settings)?;
+        tx.repo_mut().rebase_descendants(&ws.data.settings)?;
 
         let transaction_description = if abandoned_ids.len() == 1 {
             format!("abandon commit {}", abandoned_ids[0].hex())
@@ -82,12 +82,12 @@ impl Mutation for BackoutRevisions {
         let reverted = ws.resolve_multiple_changes(self.ids)?;
         let reverted_parents: Result<Vec<_>, BackendError> = reverted[0].parents().collect();
 
-        let old_base_tree = rewrite::merge_commit_trees(tx.mut_repo(), &reverted_parents?)?;
+        let old_base_tree = rewrite::merge_commit_trees(tx.repo(), &reverted_parents?)?;
         let new_base_tree = working_copy.tree()?;
         let old_tree = reverted[0].tree()?;
         let new_tree = new_base_tree.merge(&old_tree, &old_base_tree)?;
 
-        tx.mut_repo()
+        tx.repo_mut()
             .rewrite_commit(&ws.data.settings, &&working_copy)
             .set_tree_id(new_tree.id())
             .write()?;
@@ -113,7 +113,7 @@ impl Mutation for CheckoutRevision {
             return Ok(MutationResult::Unchanged);
         }
 
-        tx.mut_repo().edit(ws.id().clone(), &edited)?;
+        tx.repo_mut().edit(ws.id().clone(), &edited)?;
 
         match ws.finish_transaction(tx, format!("edit commit {}", edited.id().hex()))? {
             Some(new_status) => {
@@ -145,11 +145,11 @@ impl Mutation for CreateRevision {
         let merged_tree = rewrite::merge_commit_trees(tx.repo(), &parent_commits)?;
 
         let new_commit = tx
-            .mut_repo()
+            .repo_mut()
             .new_commit(&ws.settings, parent_ids, merged_tree.id())
             .write()?;
 
-        tx.mut_repo().edit(ws.id().clone(), &new_commit)?;
+        tx.repo_mut().edit(ws.id().clone(), &new_commit)?;
 
         match ws.finish_transaction(tx, "new empty commit")? {
             Some(new_status) => {
@@ -179,7 +179,7 @@ impl Mutation for DescribeRevision {
         }
 
         let mut commit_builder = tx
-            .mut_repo()
+            .repo_mut()
             .rewrite_commit(&ws.data.settings, &described)
             .set_description(self.new_description);
 
@@ -220,7 +220,7 @@ impl Mutation for DuplicateRevisions {
                 })
                 .collect();
             let clone = tx
-                .mut_repo()
+                .repo_mut()
                 .rewrite_commit(&ws.data.settings, &clonee)
                 .generate_new_change_id()
                 .set_parents(clone_parents?)
@@ -279,10 +279,10 @@ impl Mutation for InsertRevision {
         // rebase the target (which now has no children), then the new post-target tree atop it
         let rebased_id = target.id().hex();
         let target =
-            rewrite::rebase_commit(&ws.data.settings, tx.mut_repo(), target, vec![after_id])?;
+            rewrite::rebase_commit(&ws.data.settings, tx.repo_mut(), target, vec![after_id])?;
         rewrite::rebase_commit(
             &ws.data.settings,
-            tx.mut_repo(),
+            tx.repo_mut(),
             before,
             vec![target.id().clone()],
         )?;
@@ -321,7 +321,7 @@ impl Mutation for MoveRevision {
 
         // rebase the target itself
         let rebased_id = target.id().hex();
-        rewrite::rebase_commit(&ws.data.settings, tx.mut_repo(), target, parent_ids)?;
+        rewrite::rebase_commit(&ws.data.settings, tx.repo_mut(), target, parent_ids)?;
 
         match ws.finish_transaction(tx, format!("rebase commit {}", rebased_id))? {
             Some(new_status) => Ok(MutationResult::Updated { new_status }),
@@ -347,7 +347,7 @@ impl Mutation for MoveSource {
 
         // just rebase the target, which will also rebase its descendants
         let rebased_id = target.id().hex();
-        rewrite::rebase_commit(&ws.data.settings, tx.mut_repo(), target, parent_ids)?;
+        rewrite::rebase_commit(&ws.data.settings, tx.repo_mut(), target, parent_ids)?;
 
         match ws.finish_transaction(tx, format!("rebase commit {}", rebased_id))? {
             Some(new_status) => Ok(MutationResult::Updated { new_status }),
@@ -380,9 +380,9 @@ impl Mutation for MoveChanges {
         // abandon or rewrite source
         let abandon_source = remainder_tree.id() == parent_tree.id();
         if abandon_source {
-            tx.mut_repo().record_abandoned_commit(from.id().clone());
+            tx.repo_mut().record_abandoned_commit(from.id().clone());
         } else {
-            tx.mut_repo()
+            tx.repo_mut()
                 .rewrite_commit(&ws.data.settings, &from)
                 .set_tree_id(remainder_tree.id().clone())
                 .write()?;
@@ -391,20 +391,20 @@ impl Mutation for MoveChanges {
         // rebase descendants of source, which may include destination
         if tx.repo().index().is_ancestor(from.id(), to.id()) {
             let rebase_map = tx
-                .mut_repo()
+                .repo_mut()
                 .rebase_descendants_return_map(&ws.data.settings)?;
             let rebased_to_id = rebase_map
                 .get(to.id())
                 .ok_or(anyhow!("descendant to_commit not found in rebase map"))?
                 .clone();
-            to = tx.mut_repo().store().get_commit(&rebased_to_id)?;
+            to = tx.repo().store().get_commit(&rebased_to_id)?;
         }
 
         // apply changes to destination
         let to_tree = to.tree()?;
         let new_to_tree = to_tree.merge(&parent_tree, &split_tree)?;
         let description = combine_messages(&from, &to, abandon_source);
-        tx.mut_repo()
+        tx.repo_mut()
             .rewrite_commit(&ws.data.settings, &to)
             .set_tree_id(new_to_tree.id().clone())
             .set_description(description)
@@ -438,12 +438,12 @@ impl Mutation for CopyChanges {
         if &new_to_tree_id == to.tree_id() {
             Ok(MutationResult::Unchanged)
         } else {
-            tx.mut_repo()
+            tx.repo_mut()
                 .rewrite_commit(&ws.data.settings, &to)
                 .set_tree_id(new_to_tree_id)
                 .write()?;
 
-            tx.mut_repo().rebase_descendants(&ws.data.settings)?;
+            tx.repo_mut().rebase_descendants(&ws.data.settings)?;
 
             match ws.finish_transaction(tx, format!("restore into commit {}", to.id().hex()))? {
                 Some(new_status) => Ok(MutationResult::Updated { new_status }),
@@ -476,8 +476,7 @@ impl Mutation for TrackBranch {
                     precondition!("{branch_name}@{remote_name} is already tracked");
                 }
 
-                tx.mut_repo()
-                    .track_remote_branch(&branch_name, &remote_name);
+                tx.repo_mut().track_remote_branch(&branch_name, &remote_name);
 
                 match ws.finish_transaction(tx, format!("track remote branch {}", branch_name))? {
                     Some(new_status) => Ok(MutationResult::Updated { new_status }),
@@ -504,7 +503,7 @@ impl Mutation for UntrackBranch {
                     &StringPattern::everything(),
                 ) {
                     if remote != REMOTE_NAME_FOR_LOCAL_GIT_REPO && remote_ref.is_tracking() {
-                        tx.mut_repo().untrack_remote_branch(name, remote);
+                        tx.repo_mut().untrack_remote_branch(name, remote);
                         untracked.push(format!("{name}@{remote}"));
                     }
                 }
@@ -521,8 +520,8 @@ impl Mutation for UntrackBranch {
                     precondition!("{branch_name}@{remote_name} is not tracked");
                 }
 
-                tx.mut_repo()
-                    .untrack_remote_branch(&branch_name, &remote_name);
+                tx.repo_mut()
+                tx.repo_mut().untrack_remote_bookmark(&branch_name, &remote_name);
                 untracked.push(format!("{branch_name}@{remote_name}"));
             }
         }
@@ -552,9 +551,9 @@ impl Mutation for RenameBranch {
 
         let mut tx = ws.start_transaction()?;
 
-        tx.mut_repo()
+        tx.repo_mut()
             .set_local_branch_target(&self.new_name, ref_target);
-        tx.mut_repo()
+        tx.repo_mut()
             .set_local_branch_target(old_name, RefTarget::absent());
 
         match ws.finish_transaction(tx, format!("rename {} to {}", old_name, self.new_name))? {
@@ -588,7 +587,7 @@ impl Mutation for CreateRef {
                     precondition!("{} already exists", branch_name);
                 }
 
-                tx.mut_repo()
+                tx.repo_mut()
                     .set_local_branch_target(&branch_name, RefTarget::normal(commit.id().clone()));
 
                 match ws.finish_transaction(
@@ -609,7 +608,7 @@ impl Mutation for CreateRef {
                     precondition!("{} already exists", tag_name);
                 }
 
-                tx.mut_repo()
+                tx.repo_mut()
                     .set_tag_target(&tag_name, RefTarget::normal(commit.id().clone()));
 
                 match ws.finish_transaction(
@@ -644,7 +643,7 @@ impl Mutation for DeleteRef {
                     state: RemoteRefState::New,
                 };
 
-                tx.mut_repo()
+                tx.repo_mut()
                     .set_remote_branch(&branch_name, &remote_name, remote_ref);
 
                 match ws
@@ -657,7 +656,7 @@ impl Mutation for DeleteRef {
             StoreRef::LocalBranch { branch_name, .. } => {
                 let mut tx = ws.start_transaction()?;
 
-                tx.mut_repo()
+                tx.repo_mut()
                     .set_local_branch_target(&branch_name, RefTarget::absent());
 
                 match ws.finish_transaction(tx, format!("forget {}", branch_name))? {
@@ -668,7 +667,7 @@ impl Mutation for DeleteRef {
             StoreRef::Tag { tag_name } => {
                 let mut tx = ws.start_transaction()?;
 
-                tx.mut_repo().set_tag_target(&tag_name, RefTarget::absent());
+                tx.repo_mut().set_tag_target(&tag_name, RefTarget::absent());
 
                 match ws.finish_transaction(tx, format!("forget tag {}", tag_name))? {
                     Some(new_status) => Ok(MutationResult::Updated { new_status }),
@@ -700,7 +699,7 @@ impl Mutation for MoveRef {
                     precondition!("No such branch: {branch_name}");
                 }
 
-                tx.mut_repo()
+                tx.repo_mut()
                     .set_local_branch_target(&branch_name, RefTarget::normal(commit.id().clone()));
 
                 match ws.finish_transaction(
@@ -717,7 +716,7 @@ impl Mutation for MoveRef {
                     precondition!("No such tag: {tag_name}");
                 }
 
-                tx.mut_repo()
+                tx.repo_mut()
                     .set_tag_target(&tag_name, RefTarget::normal(commit.id().clone()));
 
                 match ws.finish_transaction(
@@ -887,7 +886,7 @@ impl Mutation for GitPush {
         for (remote_name, branch_updates) in remote_branch_updates.into_iter() {
             let targets = GitBranchPushTargets { branch_updates };
 
-            ws.session.callbacks.with_git(tx.mut_repo(), &|repo, cb| {
+            ws.session.callbacks.with_git(tx.repo_mut(), &|repo, cb| {
                 Ok(git::push_branches(
                     repo,
                     &git_repo,
@@ -962,7 +961,7 @@ impl Mutation for GitFetch {
         }
 
         for (remote_name, pattern) in remote_patterns {
-            ws.session.callbacks.with_git(tx.mut_repo(), &|repo, cb| {
+            ws.session.callbacks.with_git(tx.repo_mut(), &|repo, cb| {
                 git::fetch(
                     repo,
                     &git_repo,
@@ -1003,9 +1002,9 @@ impl Mutation for UndoOperation {
         let repo_loader = tx.base_repo().loader();
         let head_repo = repo_loader.load_at(&head_op)?;
         let parent_repo = repo_loader.load_at(&parent_op)?;
-        tx.mut_repo().merge(&head_repo, &parent_repo);
+        tx.repo_mut().merge(&head_repo, &parent_repo);
         let restored_view = tx.repo().view().store_view().clone();
-        tx.mut_repo().set_view(restored_view);
+        tx.repo_mut().set_view(restored_view);
 
         match ws.finish_transaction(tx, format!("undo operation {}", head_op.id().hex()))? {
             Some(new_status) => {
@@ -1073,4 +1072,69 @@ fn classify_branch_push(
             branch_name, remote_name
         )),
     }
+}
+
+impl Mutation for MoveHunk {
+    fn execute(self: Box<Self>, ws: &mut WorkspaceSession) -> Result<MutationResult> {
+        let mut tx = ws.start_transaction()?;
+
+        // Resolve the source and target commits
+        let source_commit = ws.resolve_single_change(&self.from_id)?;
+        let target_commit = ws.resolve_single_change(&self.to_id)?;
+
+        if ws.check_immutable(vec![source_commit.id().clone(), target_commit.id().clone()])? {
+            precondition!("Revisions are immutable");
+        }
+
+        // Get the trees for the source and target commits
+        let source_tree = source_commit.tree()?;
+        let target_tree = target_commit.tree()?;
+
+        // Locate the hunk in the source tree
+        let hunk_tree = locate_hunk(&source_tree, &self.hunk_id)?;
+
+        // Remove the hunk from the source tree
+        let new_source_tree = remove_hunk(&source_tree, &hunk_tree)?;
+
+        // Apply the hunk to the target tree
+        let new_target_tree = apply_hunk(&target_tree, &hunk_tree)?;
+
+        // Rewrite the source and target commits with the new trees
+        tx.repo_mut()
+            .rewrite_commit(&ws.data.settings, &source_commit)
+            .set_tree_id(new_source_tree.id().clone())
+            .write()?;
+
+        tx.repo_mut()
+            .rewrite_commit(&ws.data.settings, &target_commit)
+            .set_tree_id(new_target_tree.id().clone())
+            .write()?;
+
+        // Finish the transaction
+        match ws.finish_transaction(tx, format!("move hunk {} to {}", self.hunk_id, self.to_id.change.hex))? {
+            Some(new_status) => Ok(MutationResult::Updated { new_status }),
+            None => Ok(MutationResult::Unchanged),
+        }
+    }
+}
+
+// Helper function to locate the hunk in the source tree
+fn locate_hunk(tree: &Tree, hunk_id: &str) -> Result<Tree> {
+    // Logic to locate the hunk in the tree
+    // This is a placeholder and should be replaced with actual logic
+    Ok(tree.clone())
+}
+
+// Helper function to remove the hunk from the source tree
+fn remove_hunk(tree: &Tree, hunk_tree: &Tree) -> Result<Tree> {
+    // Logic to remove the hunk from the tree
+    // This is a placeholder and should be replaced with actual logic
+    Ok(tree.clone())
+}
+
+// Helper function to apply the hunk to the target tree
+fn apply_hunk(tree: &Tree, hunk_tree: &Tree) -> Result<Tree> {
+    // Logic to apply the hunk to the tree
+    // This is a placeholder and should be replaced with actual logic
+    Ok(tree.clone())
 }
