@@ -1,32 +1,43 @@
 use std::fmt::Display;
+use std::io::Read;
+use std::rc::Rc;
 
+use super::gui_util::WorkspaceSession;
+use crate::messages::{
+    AbandonRevisions, BackoutRevisions, ChangeHunk, ChangeId, CheckoutRevision, CopyChanges,
+    CreateRef, CreateRevision, DeleteRef, DescribeRevision, DuplicateRevisions, GitFetch, GitPush,
+    InsertRevision, MoveChanges, MoveHunk, MoveRef, MoveRevision, MoveSource, MutationResult,
+    RenameBranch, RepoStatus, RevId, StoreRef, TrackBranch, TreePath, UndoOperation, UntrackBranch,
+};
+use crate::worker::Mutation;
 use anyhow::{anyhow, Context, Result};
 use indexmap::IndexMap;
 use itertools::Itertools;
+use jj_lib::absorb::{absorb_hunks, split_hunks_to_trees, AbsorbSource};
+use jj_lib::backend;
+use jj_lib::revset::ResolvedRevsetExpression;
 use jj_lib::{
-    backend::{BackendError, CommitId},
+    backend::{BackendError, CommitId, FileId, MergedTreeId, SymlinkId, TreeId, TreeValue},
     commit::Commit,
+    conflicts::{self, MaterializedTreeValue},
     git::{self, GitBranchPushTargets, REMOTE_NAME_FOR_LOCAL_GIT_REPO},
     matchers::{EverythingMatcher, FilesMatcher, Matcher},
-    object_id::ObjectId,
+    merge::Merge,
+    merged_tree::MergedTree,
+    object_id::ObjectId as ObjectIdTrait,
     op_store::{RefTarget, RemoteRef, RemoteRefState},
     op_walk,
     refs::{self, BookmarkPushAction, BookmarkPushUpdate, LocalAndRemoteRef},
     repo::Repo,
-    repo_path::RepoPath,
+    repo_path::{RepoPath, RepoPathComponent, RepoPathComponentBuf},
     revset::{self, RevsetIteratorExt},
     rewrite::{self, RebaseOptions, RebasedCommit},
     settings::UserSettings,
+    store::Store,
     str_util::StringPattern,
+    tree::Tree,
 };
-
-use super::{gui_util::WorkspaceSession, Mutation};
-use crate::messages::{
-    AbandonRevisions, BackoutRevisions, CheckoutRevision, CopyChanges, CreateRef, CreateRevision,
-    DeleteRef, DescribeRevision, DuplicateRevisions, GitFetch, GitPush, InsertRevision,
-    MoveChanges, MoveRef, MoveRevision, MoveSource, MutationResult, RenameBranch, StoreRef,
-    TrackBranch, TreePath, UndoOperation, UntrackBranch,
-};
+use pollster::block_on;
 
 macro_rules! precondition {
     ($($args:tt)*) => {
@@ -49,7 +60,10 @@ impl Mutation for AbandonRevisions {
         }
 
         for id in &abandoned_ids {
-            let commit = tx.repo().store().get_commit(id)
+            let commit = tx
+                .repo()
+                .store()
+                .get_commit(id)
                 .context("Failed to lookup commit")?;
             tx.repo_mut().record_abandoned_commit(&commit);
         }
@@ -280,13 +294,8 @@ impl Mutation for InsertRevision {
 
         // rebase the target (which now has no children), then the new post-target tree atop it
         let rebased_id = target.id().hex();
-        let target =
-            rewrite::rebase_commit(tx.repo_mut(), target, vec![after_id])?;
-        rewrite::rebase_commit(
-            tx.repo_mut(),
-            before,
-            vec![target.id().clone()],
-        )?;
+        let target = rewrite::rebase_commit(tx.repo_mut(), target, vec![after_id])?;
+        rewrite::rebase_commit(tx.repo_mut(), before, vec![target.id().clone()])?;
 
         match ws.finish_transaction(tx, format!("rebase commit {}", rebased_id))? {
             Some(new_status) => Ok(MutationResult::Updated { new_status }),
@@ -392,15 +401,18 @@ impl Mutation for MoveChanges {
         // rebase descendants of source, which may include destination
         if tx.repo().index().is_ancestor(from.id(), to.id()) {
             let mut rebase_map = std::collections::HashMap::new();
-            tx.repo_mut().rebase_descendants_with_options(&RebaseOptions::default(), |old_commit, rebased_commit| {
-                rebase_map.insert(
-                    old_commit.id().clone(),
-                    match rebased_commit {
-                        RebasedCommit::Rewritten(new_commit) => new_commit.id().clone(),
-                        RebasedCommit::Abandoned { parent_id } => parent_id,
-                    },
-                );
-            })?;
+            tx.repo_mut().rebase_descendants_with_options(
+                &RebaseOptions::default(),
+                |old_commit, rebased_commit| {
+                    rebase_map.insert(
+                        old_commit.id().clone(),
+                        match rebased_commit {
+                            RebasedCommit::Rewritten(new_commit) => new_commit.id().clone(),
+                            RebasedCommit::Abandoned { parent_id } => parent_id,
+                        },
+                    );
+                },
+            )?;
             let rebased_to_id = rebase_map
                 .get(to.id())
                 .ok_or_else(|| anyhow!("descendant to_commit not found in rebase map"))?
@@ -744,6 +756,187 @@ impl Mutation for MoveRef {
     }
 }
 
+impl Mutation for MoveHunk {
+    fn execute(self: Box<Self>, ws: &mut WorkspaceSession) -> Result<MutationResult> {
+        use anyhow::anyhow;
+        use jj_lib::backend::TreeValue;
+        use jj_lib::merged_tree::MergedTreeBuilder;
+
+        // Resolve the source and target commits
+        let from_commit = ws.resolve_single_change(&self.from_id)?;
+        let target_commit = ws.resolve_single_commit(&self.to_id)?;
+
+        // Convert the file path from our message to a RepoPath
+        let repo_path = RepoPath::from_internal_string(&self.path.repo_path);
+
+        let store = ws.repo().store();
+
+        // Retrieve the source file content
+        let from_tree = from_commit.tree()?;
+        let from_entry = from_tree.path_value(&repo_path).expect(&format!(
+            "File {} not found in source revision",
+            self.path.repo_path
+        ));
+        let from_value = jj_lib::conflicts::materialize_tree_value(store, &repo_path, from_entry);
+        let (from_orig, from_executable) = if let jj_lib::conflicts::MaterializedTreeValue::File {
+            mut reader,
+            executable,
+            ..
+        } = block_on(from_value)?
+        {
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf)?;
+            (buf, executable)
+        } else {
+            return Ok(MutationResult::PreconditionError {
+                message: "Source value is not a file".to_string(),
+            });
+        };
+
+        // Retrieve the target file content, if it exists, otherwise use empty content
+        let to_tree = target_commit.tree()?;
+        let to_value = to_tree
+            .path_value(&repo_path)
+            .map(|entry| {
+                block_on(jj_lib::conflicts::materialize_tree_value(
+                    store, &repo_path, entry,
+                ))
+            })
+            .expect(&format!(
+                "File {} not found in target revision",
+                self.path.repo_path
+            ));
+        let (to_orig, to_executable) = if let jj_lib::conflicts::MaterializedTreeValue::File {
+            mut reader,
+            executable,
+            ..
+        } = to_value?
+        {
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf)?;
+            (buf, executable)
+        } else {
+            (Vec::new(), false)
+        };
+
+        // Remove the hunk from the source content and insert it into the target content
+        let new_from_string = remove_hunk(&from_orig, &self.hunk);
+        let new_to_string = insert_hunk(&to_orig, &self.hunk);
+
+        // Write new blobs to the store
+        let new_from_blob =
+            pollster::block_on(store.write_file(&repo_path, &mut new_from_string.into_bytes().as_slice()))?;
+        let new_to_blob =
+            pollster::block_on(store.write_file(&repo_path, &mut new_to_string.into_bytes().as_slice()))?;
+
+        // Update trees for source and target commits
+        let new_from_tree_id = update_tree_entry(
+            store,
+            &from_tree,
+            &repo_path,
+            new_from_blob,
+            from_executable,
+        )?;
+        let new_to_tree_id =
+            update_tree_entry(store, &to_tree, &repo_path, new_to_blob, to_executable)?;
+
+        // Start a transaction and rewrite both commits with the updated trees
+        let mut tx = ws.start_transaction()?;
+        tx.repo_mut()
+            .rewrite_commit(&from_commit)
+            .set_tree_id(new_from_tree_id)
+            .write()?;
+        tx.repo_mut()
+            .rewrite_commit(&target_commit)
+            .set_tree_id(new_to_tree_id)
+            .write()?;
+
+        // Rebase descendants if necessary
+        tx.repo_mut().rebase_descendants()?;
+
+        match ws.finish_transaction(
+            tx,
+            format!(
+                "move hunk in file {} from commit {:?} to commit {:?}",
+                self.path.repo_path,
+                ws.format_commit_id(from_commit.id()).hex,
+                ws.format_commit_id(target_commit.id()).hex
+            ),
+        )? {
+            Some(new_status) => Ok(MutationResult::Updated { new_status }),
+            None => Ok(MutationResult::Unchanged),
+        }
+    }
+}
+
+// Helper function to remove a hunk from the source content.
+// Assumes that ChangeHunk.location.from_file provides a 1-indexed start and length.
+fn remove_hunk(content: &[u8], hunk: &ChangeHunk) -> String {
+    let text = String::from_utf8_lossy(content);
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    // Adjust for 0-indexed array; hunk.location.from_file.start is 1-indexed
+    let start = hunk.location.from_file.start.saturating_sub(1);
+    let end = start + hunk.location.from_file.len;
+    lines.splice(start..end, std::iter::empty());
+    lines.join("\n")
+}
+
+// Helper function to insert a hunk into the target content.
+// Assumes that ChangeHunk.location.to_file provides a 1-indexed insertion point.
+// It collects added lines (those starting with '+') from the hunk and inserts them.
+fn insert_hunk(content: &[u8], hunk: &ChangeHunk) -> String {
+    let text = String::from_utf8_lossy(content);
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let insert_at = hunk.location.to_file.start.saturating_sub(1);
+    let plus_lines: Vec<String> = hunk
+        .lines
+        .lines
+        .iter()
+        .filter(|l| l.starts_with('+'))
+        .map(|l| {
+            let line = l[1..].trim_end();
+            // Skip diff markers or conflict indicators.
+            if line.starts_with("<<<<<<<") || line.starts_with("|||||||") || line.starts_with("=======") || line.is_empty() {
+                "".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    lines.splice(insert_at..insert_at, plus_lines);
+    let mut result = lines.join("\n");
+    if !result.ends_with("\n") {
+        result.push('\n');
+    }
+    result
+}
+
+// Helper function to update a tree at a given file path with a new blob.
+// It creates a new tree builder from the original tree, sets the file to the new blob,
+// and writes out the new tree. Returns the new tree id.
+fn update_tree_entry(
+    store: &std::sync::Arc<Store>,
+    original_tree: &MergedTree,
+    path: &RepoPath,
+    new_blob: FileId,
+    executable: bool,
+) -> Result<MergedTreeId, anyhow::Error> {
+    use jj_lib::backend::TreeValue;
+    use jj_lib::merged_tree::MergedTreeBuilder;
+
+    let mut builder = MergedTreeBuilder::new(original_tree.id().clone());
+    builder.set_or_remove(
+        path.to_owned(),
+        jj_lib::merge::Merge::normal(TreeValue::File {
+            id: new_blob,
+            executable,
+        }),
+    );
+    let new_tree_id = builder.write_tree(store)?;
+    Ok(new_tree_id)
+}
+
 impl Mutation for GitPush {
     fn execute(self: Box<Self>, ws: &mut WorkspaceSession) -> Result<MutationResult> {
         let mut tx = ws.start_transaction()?;
@@ -978,7 +1171,16 @@ impl Mutation for GitFetch {
         for (remote_name, pattern) in remote_patterns {
             ws.session.callbacks.with_git(tx.repo_mut(), &|repo, cb| {
                 let mut fetcher = git::GitFetch::new(repo, &git_settings)?;
-                fetcher.fetch(&remote_name, &[pattern.clone().map(StringPattern::exact).unwrap_or_else(StringPattern::everything)], cb, None)
+                fetcher
+                    .fetch(
+                        &remote_name,
+                        &[pattern
+                            .clone()
+                            .map(StringPattern::exact)
+                            .unwrap_or_else(StringPattern::everything)],
+                        cb,
+                        None,
+                    )
                     .context("failed to fetch")?;
                 Ok(())
             })?;
